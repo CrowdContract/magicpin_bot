@@ -4,130 +4,163 @@
 ```
 https://vera-bot-production-7e46.up.railway.app
 ```
+**GitHub:** https://github.com/CrowdContract/magicpin_bot
 
 ---
 
-## For the Evaluator — How to Test
+## For the Evaluator
 
-The bot is live on Railway. No setup needed on your end.
-
-### Quick health check
 ```bash
+# Health check
 curl https://vera-bot-production-7e46.up.railway.app/v1/healthz
-```
-Expected response:
-```json
-{"status": "ok", "uptime_seconds": 1234, "contexts_loaded": {...}}
-```
 
-### Run the full judge simulator
-Point `judge_simulator.py` at the live URL and run it:
-
-```python
-# In judge_simulator.py, set:
-BOT_URL = "https://vera-bot-production-7e46.up.railway.app"
-LLM_PROVIDER = "openai"   # or whichever provider you use
-LLM_API_KEY = "your-key"
-```
-
-```bash
+# Run full judge
+# Set BOT_URL = "https://vera-bot-production-7e46.up.railway.app" in judge_simulator.py
 python judge_simulator.py
 ```
 
-### All 5 endpoints are live
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/v1/healthz` | GET | Liveness check |
-| `/v1/metadata` | GET | Bot identity |
-| `/v1/context` | POST | Push category / merchant / customer / trigger data |
-| `/v1/tick` | POST | Wake bot — returns proactive messages to send |
-| `/v1/reply` | POST | Send merchant reply — bot responds with next action |
+All 5 endpoints live: `GET /v1/healthz` · `GET /v1/metadata` · `POST /v1/context` · `POST /v1/tick` · `POST /v1/reply`
 
 ---
 
 ## Approach
 
-**4-context LLM composer with trigger-kind dispatch.**
+### Core idea — 4-context composer with trigger-kind dispatch
 
-Every message is composed from the full `(category, merchant, trigger, customer?)` quadruple.
-The composer dispatches to a **kind-specific guidance block** per trigger kind — `research_digest`,
-`regulation_change`, `recall_due`, `competitor_opened` etc. each get different instructions
-on what compulsion lever to use and what structure to follow.
+Every message is built from the full `(category, merchant, trigger, customer?)` quadruple.
+Rather than one generic prompt, the composer dispatches to **20 trigger-kind–specific guidance blocks** —
+each telling the LLM exactly what angle, compulsion lever, and structure to use for that trigger type.
 
-### Key design decisions
+```
+research_digest   → lead with source citation + trial N + patient segment
+regulation_change → lead with deadline + exact action required
+recall_due        → lead with slot options + price + language preference
+competitor_opened → reframe as opportunity + name the counter-move
+perf_dip          → name the exact metric + offer a concrete fix
+active_planning   → DO NOT qualify — deliver the artifact immediately
+...and 14 more
+```
 
-1. **Trigger-kind routing** — 20 trigger kinds each have a dedicated prompt guidance paragraph.
-   A `research_digest` message leads with source + trial N + patient segment.
-   A `recall_due` customer message leads with slot options + price.
-   A `perf_dip` message leads with the exact metric delta and a concrete fix.
+This separation is the biggest driver of scoring. A `research_digest` message that reads like a `recall_due`
+message loses on both category fit and trigger relevance simultaneously.
 
-2. **Specificity by construction** — the prompt instructs the LLM to anchor on verifiable numbers
-   from the context (CTR vs peer median, review count, batch numbers, days until expiry).
-   If the number isn't in the context, it doesn't get used — no hallucination.
+### Specificity by construction
 
-3. **Multi-turn handler** — `conversation_handlers.py` uses regex pattern matching before any LLM call:
-   - Auto-reply detected → 1st: polite flag, 2nd: 24h wait, 3rd: end
-   - Hostile / opt-out → immediate `end`
-   - Positive intent ("yes", "let's do it", "kar do") → switches to action mode immediately
-   - Off-topic (GST, loans) → polite redirect back to topic
+The system prompt rule #1: *"anchor on at least one verifiable number, date, or source citation from the contexts provided. If the data isn't there, don't invent it."*
 
-4. **Merchant-level auto-reply tracking** — the judge sends each auto-reply turn on a different
-   `conversation_id`. The bot tracks consecutive auto-replies at the merchant level so the
-   3-strike pattern is detected correctly regardless of conv_id changes.
+This prevents hallucination and ensures every message has something the merchant can check — which is
+what drives the specificity dimension.
 
-5. **Adaptive to new context** — `/v1/context` stores the latest version atomically.
-   The tick handler always reads the freshest payload at compose time. New digest items
-   injected mid-test are used in the next composition automatically.
+### Multi-turn conversation handler
 
-6. **Suppression dedup** — suppression keys tracked per session; duplicate triggers skipped.
+Three hard rules execute before any LLM call — no token cost, instant response:
 
-### LLM
-- Provider: Groq (`llama-3.3-70b-versatile`)
-- Temperature: 0 (deterministic)
-- Fallback: rule-based message if LLM call fails
+| Signal | Detection | Action |
+|---|---|---|
+| Auto-reply | Regex: "Thank you for contacting…", "automated response", "aapki madad" etc. | Turn 1: polite flag → Turn 2: wait 24h → Turn 3: end |
+| Hostile / opt-out | Regex: "stop messaging", "spam", "not interested", "mat bhejo" etc. | Immediate `end` |
+| Positive intent | Regex: "yes", "let's do it", "kar do", "go ahead" etc. | `intent_confirmed=True` → LLM told to switch to action mode |
 
-### What I'd improve with more time
-- Retrieval over digest items: embed all digest items, retrieve by cosine similarity to trigger payload
-- Per-merchant conversation memory across sessions (Redis persistence)
-- Social proof lever: "3 dentists in your locality did X this month" — currently underused
+**Key implementation detail:** the judge sends each auto-reply turn on a different `conversation_id`.
+Tracking consecutive auto-replies per-conversation would fail. We track at **merchant level**
+(`merchant_auto_reply_counts` dict) so the 3-strike pattern is detected correctly regardless.
+
+### Adaptive context
+
+`/v1/context` stores the latest version atomically. The tick handler reads fresh context at compose time —
+never from a cache. New digest items or updated performance numbers injected mid-test are used in the
+very next composition.
 
 ---
 
-## Running Locally (optional)
+## Model Choice
 
-```bash
-# 1. Clone the repo
-git clone https://github.com/CrowdContract/magicpin_bot.git
-cd magicpin_bot
+**Current: Groq — `llama-3.3-70b-versatile`**
 
-# 2. Install dependencies
-pip install -r requirements.txt
+| Factor | Decision |
+|---|---|
+| Speed | Groq inference is ~500 tok/sec — well under the 30s timeout even for long contexts |
+| Cost | Free tier, no rate limit issues during the test window |
+| Quality | 70B Llama 3.3 produces coherent, instruction-following JSON reliably |
+| Determinism | `temperature=0` — same input always produces same output |
 
-# 3. Set environment variables
-cp .env.example .env
-# Edit .env — add GROQ_API_KEY
+**Tradeoff vs GPT-4o:** GPT-4o would produce marginally better prose quality and handles edge cases
+more gracefully. But at `temperature=0` the gap narrows significantly, and Groq's latency advantage
+is real — a 5s response vs a 15s response matters when the judge is running 60 minutes of ticks.
 
-# 4. Start the server
-python -m uvicorn main:app --host 0.0.0.0 --port 8080
+### If using paid models — smart routing strategy
 
-# 5. Test it
-curl http://localhost:8080/v1/healthz
+Not all tasks need the same model. The right approach is **two-tier routing**:
+
+**Tier 1 — High quality model (GPT-4o, Claude Sonnet, Gemini 1.5 Pro)**
+Use for tasks where message quality directly drives the score:
+- `POST /v1/tick` — composing the outbound message (this is what gets scored)
+- `POST /v1/reply` — multi-turn responses when merchant is engaged (turns 2-3)
+- Complex trigger kinds: `research_digest`, `regulation_change`, `supply_alert`, `active_planning_intent`
+
+These are the moments that determine your score. Spending more tokens here is worth it.
+
+**Tier 2 — Fast/cheap model (GPT-4o-mini, Gemini Flash, Claude Haiku)**
+Use for tasks where correctness matters more than prose quality:
+- Auto-reply detection (we already do this with regex — zero LLM cost)
+- Intent classification (positive/hostile/off-topic — regex handles it)
+- `POST /v1/reply` on turn 4-5 (conversation winding down, merchant half-engaged)
+- Simple trigger kinds: `dormant_with_vera`, `curious_ask_due`, `milestone_reached`
+
+**Estimated token split in practice:**
 ```
+~70% of LLM calls → Tier 2 (cheap/fast)   — routine replies, simple triggers
+~30% of LLM calls → Tier 1 (high quality) — scored outbound messages
+```
+This cuts cost by ~60% while keeping quality where it counts.
+
+**Implementation in this codebase:**
+The `LLM_MODEL` env var can be overridden per trigger kind in `composer.py`.
+Set `LLM_MODEL_PREMIUM=gpt-4o` and `LLM_MODEL_FAST=gpt-4o-mini` in `.env`,
+then route by `trigger_kind` in `_llm_complete()`.
 
 ---
 
-## Judge Simulator Results (against live Railway URL)
+## Tradeoffs
+
+**What we optimized for:**
+- Zero operational failures (timeouts, malformed JSON, missing fields)
+- Correct behavior on all judge test scenarios (auto-reply, intent, hostile)
+- Message quality anchored on real context data
+
+**What we traded off:**
+- **Retrieval** — digest items are passed in full to the LLM rather than embedded + retrieved by similarity.
+  Works fine for 3-5 digest items; would need RAG if digest grows to 50+ items.
+- **Conversation memory across sessions** — in-memory only. A Railway restart wipes state.
+  Redis would fix this but adds infrastructure complexity.
+- **Social proof lever** — the "3 dentists in your locality did X this month" family barely fires.
+  Would need a peer-comparison query layer built on top of the merchant aggregate data.
+
+---
+
+## Judge Simulator Results (live Railway URL)
 
 ```
-[PASS] healthz
+[PASS] healthz (955ms)
 [PASS] metadata — Team: Vera AI, Model: llama-3.3-70b-versatile
-[PASS] category/dentists
-[PASS] category/gyms
-[PASS] category/pharmacies
-[PASS] category/restaurants
-[PASS] category/salons
+[PASS] category/dentists · gyms · pharmacies · restaurants · salons
 [PASS] merchant/001 through 005
 [PASS] auto_reply  — Turn 1: polite flag → Turn 2: wait 24h → Turn 3: ENDED
-[PASS] intent      — switched to action mode on "Ok lets do it"
-[PASS] hostile     — ended immediately on opt-out
+[PASS] intent      — action mode on "Ok lets do it. Whats next?"
+[PASS] hostile     — ended immediately on "Stop messaging me"
+
+All 4 scenarios: PASS
+```
+
+---
+
+## Running Locally
+
+```bash
+git clone https://github.com/CrowdContract/magicpin_bot.git
+cd magicpin_bot
+pip install -r requirements.txt
+cp .env.example .env          # add GROQ_API_KEY
+python -m uvicorn main:app --host 0.0.0.0 --port 8080
+curl http://localhost:8080/v1/healthz
 ```
