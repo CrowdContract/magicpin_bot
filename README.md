@@ -133,8 +133,6 @@ then route by `trigger_kind` in `_llm_complete()`.
   Works fine for 3-5 digest items; would need RAG if digest grows to 50+ items.
 - **Conversation memory across sessions** — in-memory only. A Railway restart wipes state.
   Redis would fix this but adds infrastructure complexity.
-- **Social proof lever** — the "3 dentists in your locality did X this month" family barely fires.
-  Would need a peer-comparison query layer built on top of the merchant aggregate data.
 
 ---
 
